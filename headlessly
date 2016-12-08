@@ -1,0 +1,561 @@
+#!/bin/bash
+# $ Depends: Xvfb, Xvnc, ratpoison
+#!/bin/bash
+
+# Add additional command dependencies for your script in the block below
+#  "Boilerplate ends".  `bash` and all its builtins are implicit.
+#
+# $ Depends: basename realpath dirname tempfile rm echo stty
+
+SIZE=( $(stty size) )
+
+#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#
+# Bryan's Basic Boilerplate: Bashing Beyond Barriers  #
+#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#
+
+# VERBOSE controls what `detail` calls are passed; the first argument
+#	to `detail` must be VERBOSE or less, or the message is swallowed
+#		0 is default, passes errors, details with verbosity 0 or less
+#		1 passes errors, warnings, details with verbosity 1 or less
+#		2 is most built-in verbose, and passes errors, warnings, and info
+#		-1 hides all builtins (but not unfiltered program output)
+VERBOSE=0
+SOURCES=( "$0" )
+function source() {
+	. "$1"
+	SOURCES=( "${SOURCES[@]}" "$1" )
+}
+
+# For use in usage(), log messages, and to determine the prefix for temp files
+SCRIPT_NAME="$(basename $0)"
+if [ -n "$(which realpath)" ]; then
+	SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+else
+	SCRIPT_DIR="$(dirname "$0")"
+fi
+
+# Will hold the non-flag content of $@
+ARGS=()
+
+LOG_LEAD="\e[1m[\e[0m$SCRIPT_NAME\e[1m]\e[0m\e[39m"
+
+# Write a message to stderr
+# log {message...}
+function log() {
+	echo -e "${@}" >&2
+}
+
+# Write an informative message with decoration, only prints if VERBOSE>=minVerbosityLevel
+# detail {minVerbosityLevel} {message...}
+function detail() {
+	local LEVEL=$1; shift
+	if [ $VERBOSE -ge $LEVEL ]; then
+		log -e "${@}"
+	fi
+}
+
+# Write an informative message with decoration, only prints if VERBOSE>=2
+# info {message...}
+function info() {
+	detail 2 "$LOG_LEAD" "${@}"
+}
+
+# Write an warning message with decoration, only prints if VERBOSE>=1
+# warn {message...}
+function warn() {
+	detail 1 "$LOG_LEAD \e[93mWarning\e[33m: ${@}\e[0m"
+}
+
+# Write a recoverable error with decoration
+# Usage: failure {message...}
+function failure() {
+	if [ $VERBOSE -gt -1 ]; then
+		log "$LOG_LEAD \e[91mError\e[31m: ${@}\e[0m"
+	fi
+}
+
+# Write an error and exit
+# Usage: error {errorLevel} {message...}
+function error() {
+	local LEVEL=$1; shift
+	failure "${@}"
+	exit $LEVEL
+}
+
+function backupBeforeOverwrite() {
+	local FILE
+	local RM
+	local DIR
+	local BASE
+	local REV
+	local revision
+	local NAME
+	local NFN
+	FILE="$1"
+	RM="$2"
+	if [[ -e "$FILE" ]]; then
+		DIR="$(dirname "${FILE}")"
+		BASE="$(basename "${FILE}")"
+		REV="${BASE##*~}"
+		NAME="${BASE%~*}"
+		# if name == rev, 99.99% of cases are that there is no rev.
+		if [[ "$NAME" == "$REV" ]]; then
+			REV="0"
+		fi
+		let revision=( $REV + 1 ) 2>/dev/null
+
+		# previous revision string was non-numeric
+		if [[ -z "$revision" ]]; then
+			let revision=1
+		fi
+		echo "${REV} -> ${revision}"
+		NFN="${DIR}/${NAME}~${revision}"
+		backupBeforeOverwrite "${NFN}" "${RM}"
+
+		if [[ "$RM" == "MOVE" ]]; then
+			info "Moving ${FILE} to ${NFN}"
+			mv "${FILE}" "${NFN}"
+		else
+			info "Making copy of ${FILE} at ${NFN}"
+			cp "${FILE}" "${NFN}"
+		fi
+	fi
+}
+
+# Write out a command and run it
+# vexec {minVerbosity} {prefixMessage} {command...}
+function vexec() {
+	local LEVEL=$1; shift
+	local MSG="$1"; shift
+	if [ $VERBOSE -ge $LEVEL ]; then
+		echo -n "$MSG: " >&2
+		local CMD=( )
+		for i in "${@}"; do
+			# Replace argument's spaces with ''; if different, quote the string
+			if [ "$i" != "${i/ /}" ]; then
+				echo -n " '${i}'" >&2
+			else
+				echo -n " ${i}" >&2
+			fi
+		done
+		echo "" >&2
+	fi
+	"${@}"
+}
+
+function usage() {
+	USAGE=$1; shift
+	RET=$1; shift
+	$USAGE "${@}"
+	log "	-D|--deps               list this script's command dependencies and exit"
+	log "	                        If set to verbose, dependencies are checked"
+	log "	-h|--help               This helpful message"
+	log "	-v|--verbose            Output more messages; stack for more"
+	log "	-q|--quiet              Output fewer messages; stack for less"
+	log "	--                      No further processing of flags by this script"
+	
+	if [[ $RET -eq 0 ]]; then
+		return 0;
+	fi
+	exit $RET
+}
+
+# Allows for addendum to existing EXIT/Signal traps
+# Normally, `trap FUNCTION SIGNAL` will replace the
+# existing trap; this enables multiple traps to be
+# declared for more modular cleanup.
+function addTrap() {
+	ORIG="$(trap -p EXIT | cut -d "'" -f 2)"
+	FN="$1"
+	SIG="$2"
+	if [[ -n $ORIG ]]; then
+		FN="$ORIG; $FN"
+	fi
+	trap -- "$FN" "$SIG"
+}
+
+# Temporary file management.  Create temp files with FILE="$(mktemp)";
+# all temp files will be deleted on exit
+TMP_PREFIX="$(echo "${SCRIPT_NAME}" | sha1sum | cut -c 1-5)"
+TMPS="$(tempfile --prefix="$TMP_PREFIX")"
+touch "$TMPS"
+function clean_temp_files() {
+	while read TMP; do
+		if [[ -f "$TMP" ]]; then
+			rm "$TMP"
+		fi
+	done < "$TMPS"
+	if [[ -f "$TMPS" ]]; then
+		rm "$TMPS"
+	fi
+}
+function mktemp() {
+	local TMP="$(tempfile --prefix="${TMP_PREFIX}")"
+	echo "$TMP" >> "$TMPS"
+	echo "$TMP"
+}
+addTrap clean_temp_files EXIT
+
+
+FLAG_ERROR=254
+DOUBLE_DASH=255
+
+LIST_DEPS=no
+
+# Internal flag interpreter
+# This will do the appropriate switching for --help, and -v (verbose) / -q (quiet)
+# It then hands off to your script's flag handler
+function interpret_flag_internal() {
+	local USAGE="$1"; shift
+	local INT_FLAGS="$1"; shift
+	case "$1" in
+		# User requested help.  Please don't mess with this; instead,
+		# roll up the script and implement usage().
+		h|\?|help)
+			usage $USAGE 0
+			;;
+		# Make the script more verbose
+		v|verbose)
+			VERBOSE=$((VERBOSE + 1))
+			;;
+		# Make the script quieter
+		q|quiet)
+			VERBOSE=$((VERBOSE - 1))
+			;;
+		D|deps)
+			LIST_DEPS=yes
+			;;
+		*)
+			$INT_FLAGS "${@}"
+			return $?
+	esac
+}
+# Processes one argument
+# If the argument looks like a flag (e.g., -f, --flag, or -fF), that flag is
+# handled appropriately by the logic in interpret_flag.  If not, echoes the first
+# non-flag argument.
+#
+# Follows normal Unix-y conventions; that is, -abcd is four separate flags, while
+# --abcd is a single flag called 'abcd'.  Double-dash (--) means remaining
+# arguments are _not_ flags.
+
+function interpret_argument() {
+	local USAGE="$1"; shift
+	local INT_FLAGS="$1"; shift
+	local ARG="$1"; shift
+	local TCT=0
+	local CT=
+	local i=
+	if [[ "${ARG:0:1}" != '-' ]]; then
+		# non-flag argument
+		echo "$ARG"
+		return 0
+	else
+		if [[ "$ARG" == '--' ]]; then
+			return $DOUBLE_DASH
+		elif [[ "${ARG:0:2}" == '--' ]]; then
+			interpret_flag_internal "$USAGE" "$INT_FLAGS" "${ARG:2}" "${@}"
+			return $?
+		else
+			ARG="${ARG:1}"
+			while [[ "${#ARG}" -gt 0 ]]; do
+				interpret_flag_internal "$USAGE" "$INT_FLAGS" "${ARG:0:1}" "${@}"
+				CT=$?
+				if [[ $CT == $FLAG_ERROR ]]; then
+					echo "-${ARG:0:1}"
+					return $CT
+				fi
+				TCT=$(($CT + $TCT))
+				for i in {1..$CT}; do
+					shift
+				done
+				ARG="${ARG:1}"
+			done
+			return $TCT
+		fi
+	fi
+}
+function get_position() {
+	echo -en '\e[6n' > /dev/tty
+	IFS=';' read -s -r -d R -a POS
+	echo "${POS[0]:2} ${POS[1]}"
+
+}
+function state_message() {
+	local color="$1"; shift
+	POS=( $(get_position) )
+	MSGLEN="${#@}"
+	SPACES=$((${SIZE[1]} - ${POS[1]} - 2 - $MSGLEN))
+	printf "%${SPACES}s"
+	echo -ne '[\e['"$color"'m'"${@}"'\e[0m]' >&2
+	echo -ne "\\e[${POS[0]};${POS[1]}f" >&2
+	echo -n " $COLUMNS"
+}
+function state_success() {
+	state_message 92 "${@}"
+}
+function state_failed() {
+	state_message 91 "${@}"
+}
+
+##
+# Called when you want to process your CLI
+# @param     args         name of the variable to put the arguments.
+# @param     flagHandler  name of the function that handles single flags
+# @param     usageHandler name of the function that prints a help message
+# @param     minArgs      minimum number of non-flag arguments expected; -1 for none
+# @param     maxArgs      maximum number of non-flag arguments expected; -1 for none
+# @rest      cliArgs      pass as "${@}"
+# @return    Not specified
+# @output    Silent
+# @changes   The variable named by `args` should contain an array of non-flags arguments.
+##
+function handle_args() {
+	local ARGSNAME="$1"; shift
+	local INT_FLAGS="$1"; shift
+	local USAGE="$1"; shift
+	local MINARGS="$1"; shift
+	local MAXARGS="$1"; shift
+	eval "$ARGSNAME=()"
+	# Loop over arguments; we'll be shifting the list as we go,
+	# so we keep going until $1 is empty
+	ARGTMP="$(mktemp)"
+	while [ -n "$1" ]; do
+		# Capture and shift the argument.
+		OPT="$1"
+		interpret_argument "$USAGE" "$INT_FLAGS" "${@}" > $ARGTMP
+		CT=$?
+		ARG="$(cat $ARGTMP)"
+		shift
+		if [[ $CT -eq $DOUBLE_DASH ]]; then
+			break;
+		elif [[ $CT -eq $FLAG_ERROR ]]; then
+			# interpret_argument can choose to echo an alternative representation of
+			# the real argument
+			if [[ -n "$ARG" ]]; then
+				OPT="$ARG"
+			fi
+			usage $USAGE 1 "Unknown option: '${OPT}'" >&2
+		else
+			# interpret_argument ate $CT args
+			if [[ $CT -gt 0 ]]; then
+				for i in {1..$CT}; do
+					shift
+				done
+			fi
+		fi
+
+		if [[ -n "$ARG" ]]; then
+			eval "$ARGSNAME=( \"\${$ARGSNAME[@]}\" \"\$ARG\" )"
+		fi
+	done
+	while [ -n "$1" ]; do
+		eval "$ARGSNAME=( \"\${$ARGSNAME[@]}\" \"\$1\" )"
+		shift
+	done
+	if [[ "$LIST_DEPS" == "yes" ]]; then
+		local RET=0
+		for script in ${SOURCES[@]}; do
+			for dep in $(cat "${script}" | grep -i '# ''$'' depends:' | cut -d\  -f 4-); do
+				echo -ne "$dep"
+				if [[ $VERBOSE -gt 0 ]]; then
+					if which "$dep" >/dev/null; then
+						state_success "OK"
+					else
+						state_failed "Missing"
+						RET=1
+					fi
+					echo
+				fi
+			done
+		done
+		exit $RET
+	fi
+	local ARGCT="${#ARGS[@]}"
+	if [[ $ARGCT -lt $MINARGS && $MINARGS != -1 ]]; then
+		usage $USAGE 1 "takes at least $MINARGS arguments, ${#ARGS[@]} given";
+	fi
+	if [[ $ARGCT -gt $MAXARGS && $MAXARGS != -1 ]]; then
+		usage $USAGE 1 "takes at most $MINARGS arguments, ${#ARGS[@]} given";
+	fi
+}
+
+###
+# Example of usage()
+# Usage function: tells the user what's up, then exits.  ALWAYS implement this.
+# Optionally, prints an error message
+# usage [{errorLevel} {message...}
+###
+function usage_message() {
+	log	"headlessly <flags> -- command [args...]"
+	log	"	-s|--serve-vnc          Also make a VNC server (requires Xvnc)"
+	log	"	-r|--record FILENAME    Record the session to a video"
+	log	"	-d|--display            Force use of a display (e.g., :99)"
+	log	"	                        Note: will usually just use whatever's free"
+	log "	-x|--export-env         Print values of PIDs and environment vars"
+	log	"	-g|--geometry WxH       Set geometry (default: 1440x900)"
+	log	"	-w|--window-manager CMD Set window manager (default: ratpoison)"
+}
+
+###
+# Example of interpret_flag()
+# interpret one flag.  This is where your config logic lives.
+# @param   flag  The flag to interpret, without preceding dashes
+# @rest    args  The remaining arguments to be interpreted
+# @return  An error code corresponding to the number of times you had to pull from `args`
+# @output  If your argument inserts something into the arg stack at its location,
+#          echo that with proper quotation.
+###
+MODE="Xvfb"
+D=1
+GEOM="1440x900"
+WM_CMD=
+RECORD=
+EXPORT_ENV="no"
+
+while ls /tmp/.X11-unix/X$D > /dev/null 2>&1; do
+  let D=( $D + 1 )
+done
+
+function interpret_flag() {
+	FLAG="$1"
+	while [[ "${FLAG:0:1}" == '-' ]]; do
+		FLAG="${FLAG:1}"
+	done
+	NEXT="$2"
+	case "$FLAG" in
+		d|display)
+			D="${NEXT##*:}"
+			return 1
+			;;
+		s|serve-vnc)
+			MODE="Xvnc"
+			;;
+		r|record)
+			RECORD="${NEXT}"
+			return 1
+			;;
+		g|geometry)
+			GEOM=$NEXT
+			return 1
+			;;
+		w|window-manager)
+			WM_CMD=$NEXT
+			return 1
+			;;
+		x|export-env)
+			EXPORT_ENV="yes"
+			;;
+		*)
+			return $FLAG_ERROR
+			;;
+	esac
+}
+
+if [[ "$WM_CMD" == "" ]]; then
+	if which ratpoison >/dev/null; then
+		WM_CMD="ratpoison"
+	else
+		error -1 "The default thin window manager, ratpoison isn't installed; please install it, or specify another one with -w"
+	fi
+fi
+
+# How to make boilerplate process your arguments config (methods named above)
+handle_args "ARGS" "interpret_flag" "usage_message" 1 99 "${@}"
+
+FFMPEG_PIPE=
+
+
+function cleanup() {
+	if [[ -n "$FFMPEG_PID" ]]; then
+		if ps "${FFMPEG_PID}"; then
+			info "Sending stop signal and waiting for cleanup ($FFMPEG_PID / $FFMPEG_PIPE)"
+			echo -n "q" > "$FFMPEG_PIPE"
+			wait $FFMPEG_PID
+			info "Stopped"
+		else
+			echo "FFMpeg already stopped"
+		fi
+		rm -rf "$FFMPEG_PIPE" > /dev/null 2>&1 
+	fi
+	if [[ -n "$WM_PID" ]]; then
+		info "Killing Window Manager ($WM_PID) ... "
+		kill -s SIGKILL $WM_PID > /dev/null 2>&1 && info "Terminated" || info "Already dead"
+	fi
+	if [[ -n "$X_SERVER_PID" ]]; then
+		info "Killing X Server...  ($X_SERVER_PID) "
+		kill -s SIGKILL $X_SERVER_PID > /dev/null 2>&1 && info "Terminated" || info "Already dead"
+	fi
+}
+
+trap cleanup EXIT
+
+if [[ "Xvfb" == "$MODE" ]]; then
+	if which Xvfb 2>&1 > /dev/null; then
+		vexec 1 "Starting Xvfb" Xvfb :$D -screen 0, "${GEOM}"x24 -ac +iglx +extension GLX +extension RANDR +render &
+		X_SERVER_PID=$!
+		if [[ "$EXPORT_ENV" == "yes" ]]; then
+			echo "HEADLESS_X_PID=$X_SERVER_PID"
+			echo "HEADLESS_DISPLAY=:$D"
+		fi
+		disown
+	else
+		error -1 "$SCRIPT_NAME depends on Xvfb"
+	fi
+else 
+	if which Xvnc 2>&1 > /dev/null; then
+		vexec 1 "Starting Xvnc" Xvnc :$D -geometry $GEOM -depth 24 -viewonly -x RANDR -x render -x GLX -pixelformat RGB888 &
+		X_SERVER_PID=$!
+		if [[ "$EXPORT_ENV" == "yes" ]]; then
+			echo "HEADLESS_X_PID=$X_SERVER_PID"
+			echo "HEADLESS_DISPLAY=:$D"
+			let VNC_PORT=( 5900 + $D )
+			echo "HEADLESS_VNC_PORT=$VNC_PORT"
+		fi
+		disown
+	else
+		error -1 "$SCRIPT_NAME -s depends on Xvnc"
+	fi
+fi
+
+info "X Server started ($X_SERVER_PID)"
+
+FFMPEG_PID=
+
+DISPLAY=:$D
+
+info "X Server PID: $X_SERVER_PID running on display $D at $GEOM"
+
+# Give the X server a few ms to spin up before running the WM
+sleep 0.25
+
+vexec 1 "Starting window manager" "${WM_CMD}" -d $DISPLAY &
+WM_PID=$!
+disown
+info "WM Started ($WM_PID)"
+if [[ "$EXPORT_ENV" == "yes" ]]; then
+	echo "HEADLESS_WM_PID=$WM_PID"
+fi
+sleep 0.25
+
+if [[ "$RECORD" != "" ]]; then
+	FFMPEG_PIPE="$(tempfile -p 'ffmpeg' -s '.pipe')"
+	rm -rf "${FFMPEG_PIPE}" > /dev/null 2>&1
+	mkfifo "${FFMPEG_PIPE}"
+	rm -rf "${RECORD}" > /dev/null 2>&1
+	echo -n '' > "${FFMPEG_PIPE}" & 
+	vexec 1 "Starting FFMPEG" ffmpeg -y -video_size $GEOM -framerate 15 -f x11grab -i "$DISPLAY+0,0" -threads 2 -vcodec libx264 -f mpegts "${RECORD}" < "${FFMPEG_PIPE}" > "${RECORD}.log" 2> "${RECORD}.err" &
+	FFMPEG_PID=$!
+	if [[ "$EXPORT_ENV" == "yes" ]]; then
+		echo "HEADLESS_FFMPEG_PID=$FFMPEG_PID"
+		echo "HEADLESS_FFMPEG_CMD_PIPE=$FFMPEG_PIPE"
+		echo "HEADLESS_RECORD='$RECORD'"
+	fi
+	disown
+	info "Recorder started ($FFMPEG_PID / $FFMPEG_PIPE)"
+fi
+
+
+
+
+vexec 1 "Running..." "${ARGS[@]}"
